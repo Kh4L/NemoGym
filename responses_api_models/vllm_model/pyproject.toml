@@ -19,6 +19,7 @@ version = "0.2.0rc0"
 requires-python = ">=3.12"
 dependencies = [
     "nemo-gym[dev]",
+    "transformers==5.3.0",
 ]
 
 [build-system]

@@ -53,6 +53,14 @@ uv venv --python 3.12 venv
 echo "Installing R2E-Gym in editable mode..."
 uv pip install -p $r2e_gym_dir/venv/bin/python -e . --no-cache
 
+# r2egym's eval import chain (runtime.local -> runtime.docker -> import kubernetes -> kube_config
+# -> google.auth -> cryptography) needs both cryptography and cffi, neither reliably pulled in by
+# r2egym. Without them run_local_evaluation.py fails to import (ModuleNotFoundError: cryptography,
+# then '_cffi_backend') and every eval returns code 1, so reward is always 0. cffi is named
+# explicitly because cryptography 42.x may already be satisfied, leaving its cffi dep uninstalled;
+# both ship prebuilt cp312 wheels, so no compiler is needed. Mirrors the OpenHands setup.
+uv pip install -p $r2e_gym_dir/venv/bin/python 'cryptography<43' cffi --no-cache
+
 echo "Verifying installation..."
 $r2e_gym_dir/venv/bin/python -c "import r2egym; print('✓ r2egym installed successfully')"
 
