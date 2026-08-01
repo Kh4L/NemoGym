@@ -105,8 +105,22 @@ def _normalize_ooxml_zip(src: Path, dst: Path) -> None:
             zout.writestr(item, data)
 
 
-def needs_conversion(path: Path) -> bool:
-    return path.suffix.lower() in OFFICE_EXTENSIONS and not path.with_suffix(".pdf").exists()
+def sidecar_pdf(path: Path) -> Path:
+    """The unambiguous PDF name for *path*: ``Plan.pptx`` -> ``Plan.pptx.pdf``.
+
+    Used when two Office files share a stem, where ``Plan.pdf`` cannot say which
+    of them it renders. Keeping the full original name makes the mapping
+    injective, so the pairing survives however many same-stem siblings exist.
+    """
+    return path.with_name(path.name + ".pdf")
+
+
+def needs_conversion(path: Path, *, ambiguous: bool = False) -> bool:
+    if path.suffix.lower() not in OFFICE_EXTENSIONS:
+        return False
+    if ambiguous:
+        return not sidecar_pdf(path).exists()
+    return not path.with_suffix(".pdf").exists()
 
 
 def _safe_basename(name: str) -> str:
@@ -121,15 +135,24 @@ def _safe_basename(name: str) -> str:
     return re.sub(r"\s+", "_", p.stem) + p.suffix
 
 
-def convert_to_pdf(path: Path) -> tuple[Path, bool, str]:
-    """Convert one file to PDF via host LibreOffice. Returns ``(path, ok, msg)``."""
+def convert_to_pdf(path: Path, output_pdf: Path | None = None) -> tuple[Path, bool, str]:
+    """Convert one file to PDF via host LibreOffice. Returns ``(path, ok, msg)``.
+
+    *output_pdf* overrides the destination, which same-stem Office files need:
+    LibreOffice always names its output after the input stem, so two of them
+    would race for one name. We let it write that name, then move the result to
+    the requested one.
+    """
     profile_dir = Path(tempfile.mkdtemp(prefix="lo-profile-"))
     stage_dir: Path | None = None
     input_path = path
     normalized = False
     needs_ns0_normalization = _ooxml_has_ns0_prefix(path)
     has_whitespace = any(c.isspace() for c in path.name)
-    needs_stage = needs_ns0_normalization or has_whitespace
+    # A custom destination always stages: LibreOffice names its output after the
+    # input stem, so converting a same-stem pair straight into the deliverables
+    # directory would have both processes write one name and race.
+    needs_stage = needs_ns0_normalization or has_whitespace or output_pdf is not None
     try:
         if needs_stage:
             stage_dir = Path(tempfile.mkdtemp(prefix="gdpval-stage-"))
@@ -163,7 +186,7 @@ def convert_to_pdf(path: Path) -> tuple[Path, bool, str]:
             text=True,
             timeout=120,
         )
-        final_pdf = path.with_suffix(".pdf")
+        final_pdf = output_pdf if output_pdf is not None else path.with_suffix(".pdf")
         if needs_stage:
             staged_pdf = Path(lo_outdir) / (input_path.stem + ".pdf")
             if staged_pdf.exists():
@@ -188,15 +211,29 @@ def convert_to_pdf(path: Path) -> tuple[Path, bool, str]:
             shutil.rmtree(stage_dir, ignore_errors=True)
 
 
-def find_convertible_files(root_dir: str | os.PathLike) -> list[Path]:
-    files: list[Path] = []
+def find_convertible_files(root_dir: str | os.PathLike) -> list[tuple[Path, Path | None]]:
+    """Office files needing conversion, as ``(source, explicit_destination)``.
+
+    ``Report.docx`` and ``Report.pptx`` in one directory both convert to
+    ``Report.pdf``. Whichever is seen first wins and the other races it for that
+    one output name, and afterwards nothing is detectable -- the surviving PDF
+    looks like a valid render of both.
+
+    This used to skip both and defer to the judging path, which converts an
+    ambiguous file into a tempdir. That deferral is silently fatal here: the
+    judge server runs on the *host*, where libreoffice is not installed (only
+    the preconvert container has it), so the render fails and the judge is handed
+    ``[Error: ... No such file or directory: 'libreoffice']``. It then reports
+    that no deliverables exist and scores every criterion 0 -- with
+    ``invalid_judge_response`` false, so nothing flags it. Two set A tasks per
+    arm scored a false 0 this way against rubrics worth 74 and 111 points.
+
+    So convert them here, where libreoffice is present, to the injective sidecar
+    name ``Report.docx.pdf``. ``file_reader`` prefers that name, so the pairing
+    stays unambiguous and the judge never needs a host-side fallback.
+    """
+    files: list[tuple[Path, Path | None]] = []
     for dirpath, _, filenames in os.walk(root_dir):
-        # ``Report.docx`` and ``Report.pptx`` in one directory both convert to
-        # ``Report.pdf``. Whichever is seen first wins, and the other is either
-        # skipped (its sibling now exists) or races it for that one output name in
-        # the thread pool below. Neither is detectable afterwards -- the surviving
-        # PDF looks like a valid render of both. Leave these to the judging path,
-        # which renders an ambiguous file to a tempdir instead of guessing.
         office_stems: dict[str, int] = {}
         for filename in filenames:
             path = Path(dirpath) / filename
@@ -205,17 +242,19 @@ def find_convertible_files(root_dir: str | os.PathLike) -> list[Path]:
 
         for filename in filenames:
             path = Path(dirpath) / filename
-            if not needs_conversion(path):
+            ambiguous = office_stems.get(path.stem, 0) > 1
+            if not needs_conversion(path, ambiguous=ambiguous):
                 continue
-            if office_stems.get(path.stem, 0) > 1:
-                LOGGER.warning(
-                    "Not preconverting %s: another Office file shares its stem, so '%s.pdf' is ambiguous",
+            if ambiguous:
+                LOGGER.info(
+                    "Preconverting %s to sidecar '%s': another Office file shares its stem",
                     path,
-                    path.stem,
+                    sidecar_pdf(path).name,
                 )
-                continue
-            files.append(path)
-    return sorted(files)
+                files.append((path, sidecar_pdf(path)))
+            else:
+                files.append((path, None))
+    return sorted(files, key=lambda pair: pair[0])
 
 
 def preconvert_dir(
@@ -234,15 +273,36 @@ def preconvert_dir(
     success_count = 0
     fail_count = 0
     error_messages: list[str] = []
-    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-        futures = {executor.submit(convert_to_pdf, f): f for f in files}
-        for future in as_completed(futures):
-            _, success, message = future.result()
-            if success:
-                success_count += 1
-            else:
-                fail_count += 1
-                error_messages.append(message)
+
+    # Same-stem files (those with an explicit destination) convert SEQUENTIALLY.
+    # Converting two of them at once is a new concurrency case -- previously both
+    # were skipped, so zero conversions ran for such a pair -- and LibreOffice
+    # does not survive it: a same-stem .pptx/.xlsx pair launched together aborts
+    # one side with rc=134 and a WrappedTargetRuntimeException, even though each
+    # file converts cleanly on its own (verified both in place and renamed).
+    # Per-conversion UserInstallation profiles are not sufficient here. They are
+    # a handful of files per tree, so serialising them costs almost nothing.
+    parallel = [(src, dest) for src, dest in files if dest is None]
+    serial = [(src, dest) for src, dest in files if dest is not None]
+
+    def _tally(result: tuple[Path, bool, str]) -> None:
+        nonlocal success_count, fail_count
+        _, success, message = result
+        if success:
+            success_count += 1
+        else:
+            fail_count += 1
+            error_messages.append(message)
+
+    if parallel:
+        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            futures = [executor.submit(convert_to_pdf, src, dest) for src, dest in parallel]
+            for future in as_completed(futures):
+                _tally(future.result())
+
+    for src, dest in serial:
+        _tally(convert_to_pdf(src, dest))
+
     return success_count, fail_count, error_messages
 
 

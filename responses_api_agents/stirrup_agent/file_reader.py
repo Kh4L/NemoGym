@@ -420,6 +420,16 @@ def convert_deliverables_to_content_blocks(
         if is_deliverable(entry) and entry.suffix.lower() in OFFICE_EXTS:
             office_stem_counts[entry.stem] = office_stem_counts.get(entry.stem, 0) + 1
 
+    # A sidecar render (``Plan.pptx.pdf``) is presented as part of its source
+    # Office file below, so it must not also be emitted as a standalone PDF --
+    # that would show the judge the same slides twice and invite double-counting
+    # against the rubric.
+    sidecar_pdfs = {
+        entry.with_name(entry.name + ".pdf")
+        for entry in entries
+        if is_deliverable(entry) and entry.suffix.lower() in OFFICE_EXTS
+    }
+
     # Allot the aggregate budget up front rather than first-come-first-served. Files
     # are visited in sorted order, so a spend-as-you-go budget would let two big
     # ``000_*.txt`` files starve a real ``Report.md`` -- renaming a file would change
@@ -458,7 +468,7 @@ def convert_deliverables_to_content_blocks(
         return block
 
     for fpath in entries:
-        if not is_deliverable(fpath):
+        if not is_deliverable(fpath) or fpath in sidecar_pdfs:
             continue
 
         ext = fpath.suffix.lower()
@@ -477,8 +487,15 @@ def convert_deliverables_to_content_blocks(
                 # file, rather than regenerating over the top of a corpus we did
                 # not create -- a judging pass that rewrites its own inputs makes
                 # the next run over the same tree a different experiment.
+                # Preconvert writes same-stem Office files to an injective
+                # sidecar (``Plan.pptx`` -> ``Plan.pptx.pdf``) precisely because
+                # ``Plan.pdf`` cannot say which file it renders. Prefer it: it is
+                # unambiguous by construction, whatever the stem counts are.
+                sidecar = fpath.with_name(fpath.name + ".pdf")
                 existing_pdf = fpath.with_suffix(".pdf")
-                if existing_pdf.is_file() and office_stem_counts.get(fpath.stem, 0) == 1:
+                if sidecar.is_file():
+                    pdf_path = sidecar
+                elif existing_pdf.is_file() and office_stem_counts.get(fpath.stem, 0) == 1:
                     pdf_path = existing_pdf
                 else:
                     # Convert into a tempdir, never next to the original: that keeps
