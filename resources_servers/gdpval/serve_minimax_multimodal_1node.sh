@@ -64,6 +64,7 @@ touch "${LOG_FILE}"
 # Single-node: no cross-node allreduce backend is set (custom/PyNCCL intra-node is
 # correct and fast). VLLM_ALLREDUCE_USE_SYMM_MEM=0 kept from the reference env.
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+export LIMIT_MM='{"image": 256, "video": 8}'
 export OUTPUT_DIR LUSTRE_DIR VLLM_IMAGE MODEL_PATH MODEL_NAME LOG_FILE TP API_PORT
 
 echo "Serving '${MODEL_NAME}' (multimodal) at TP=${TP} on 1 node"
@@ -106,9 +107,10 @@ srun \
         --reasoning-parser minimax_m3 \
         --mm-encoder-attn-backend TORCH_SDPA \
         --enable-prefix-caching \
-        --gpu-memory-utilization 0.90 \
+        --gpu-memory-utilization 0.92 \
         --max-num-seqs 128 \
-        --max-model-len 1048576 \
+        --max-model-len 786432 \
+        --limit-mm-per-prompt "${LIMIT_MM}" \
         --host 0.0.0.0 \
         --port "${API_PORT}" \
         --compilation-config "{\"pass_config\": {\"fuse_allreduce_rms\": false}}" \
