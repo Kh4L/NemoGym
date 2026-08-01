@@ -99,7 +99,14 @@ def test_file_exactly_at_the_cap_is_not_marked_truncated(tmp_path: Path):
     assert joined.count("Z") == MAX_TEXT_BLOCK_CHARS, "an exactly-at-cap file must pass through whole"
 
 
-def test_empty_and_whitespace_only_files_produce_no_block(tmp_path: Path):
+def test_empty_and_whitespace_only_files_are_named_but_contribute_no_content(tmp_path: Path):
+    """An empty deliverable is REPORTED as empty, not omitted.
+
+    Omitting it made "wrote a file with nothing in it" indistinguishable from
+    "never wrote the file at all", and the judge -- handed a deliverable list the
+    file was absent from -- graded it as non-delivery. The file must be named; its
+    (absent) content must not be.
+    """
     d = tmp_path / "repeat_0"
     d.mkdir()
     (d / "Empty.txt").write_text("")
@@ -108,7 +115,8 @@ def test_empty_and_whitespace_only_files_produce_no_block(tmp_path: Path):
 
     joined = _text_of(convert_deliverables_to_content_blocks(str(d)))
 
-    assert "Empty.txt" not in joined and "Blank.txt" not in joined
+    assert "Empty.txt" in joined and "Blank.txt" in joined
+    assert joined.count("EMPTY") == 2
     assert "content" in joined
 
 

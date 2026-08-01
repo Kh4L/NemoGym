@@ -246,14 +246,28 @@ class TestRubricImagesAndText:
             b.get("type") == "image_url" and "application/pdf" in b.get("image_url", {}).get("url", "") for b in blocks
         )
 
-    def test_convert_deliverables_skips_audio_when_not_av_capable(self, tmp_path) -> None:
+    def test_convert_deliverables_discloses_audio_when_not_av_capable(self, tmp_path) -> None:
+        """Undecodable audio is DISCLOSED, never dropped.
+
+        Skipping the media block is correct -- the judge genuinely cannot decode
+        it. Emitting *nothing at all* was not: the judge concluded the file had
+        never been produced and graded ~30 audio criteria against that false
+        premise. On set A the five .wav tasks averaged 0.213 against 0.630 for
+        everything else, one of them scored 0.0 with the judge writing "there is
+        no actual .wav file included" about a 39 MB file on disk.
+        """
         from responses_api_agents.stirrup_agent.file_reader import convert_deliverables_to_content_blocks
 
         (tmp_path / "clip.mp3").write_bytes(b"ID3fakeaudio")
         blocks = convert_deliverables_to_content_blocks(
             str(tmp_path), media_mode="images_and_text", audio_capable=False
         )
-        assert blocks == []
+        # No audio block -- but the file is named, with the reason it is unplayable.
+        assert all(b.get("type") == "text" for b in blocks)
+        joined = " ".join(b["text"] for b in blocks)
+        assert "clip.mp3" in joined
+        assert "AUDIO deliverable" in joined
+        assert "cannot decode audio" in joined
 
     def test_convert_deliverables_audio_passthrough_when_av_capable(self, tmp_path) -> None:
         # images_and_text == self-hosted vLLM judge -> input_audio (not image_url).

@@ -203,13 +203,40 @@ def _read_pptx(fpath: Path) -> str:
 # PDF conversion for visual judging (Gemini 3 Pro)
 # ---------------------------------------------------------------------------
 
-OFFICE_EXTS = {".docx", ".pptx", ".xlsx"}
-TEXT_EXTS = {".txt", ".md", ".csv", ".json", ".xml", ".html", ".yaml", ".yml", ".py", ".sh", ".log"}
+OOXML_EXTS = {".docx", ".pptx", ".xlsx"}
+# Legacy binary Office formats. LibreOffice renders these as readily as OOXML and
+# ``resources_servers/gdpval/preconvert.py`` has always converted them (its
+# ``LEGACY_OFFICE_EXTENSIONS``) -- but this set did not list them, so file_reader
+# never looked for the sibling PDF preconvert had already written and the file
+# reached no handler at all. Three such files in set A's c80a arm alone.
+LEGACY_OFFICE_EXTS = {".doc", ".ppt", ".xls"}
+OFFICE_EXTS = OOXML_EXTS | LEGACY_OFFICE_EXTS
+# Extensions read as plain text. Deliberately generous: a file that reaches no
+# handler in ``convert_deliverables_to_content_blocks`` emits NOTHING, and the
+# judge reads that silence as non-delivery. Measured on set A (2,392 judged
+# rollouts): 8 tasks whose deliverables were ``.ts`` / ``.ipynb`` / ``.toml`` /
+# ``.zip`` averaged 0.1995 against 0.6401 for everything else, one of them graded
+# "Missing: all 13 source modules" against a directory holding 31 files. Source
+# and config files are the entire deliverable for a whole occupation category
+# (Software Developers), so they are first-class here rather than an afterthought.
+TEXT_EXTS = (
+    {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".jsonl", ".xml", ".html", ".htm", ".svg"}
+    | {".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".properties", ".env"}
+    | {".py", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".sql", ".r", ".tex", ".ipynb"}
+    | {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".css", ".scss", ".less"}
+    | {".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".kt", ".swift"}
+    | {".rb", ".php", ".pl", ".lua", ".scala", ".jl", ".m", ".log", ".diff", ".patch"}
+)
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif"}
 # Audio/video are only passed through when the judge is AV-capable (e.g. MiniMax
 # M3); image-only judges can't decode them, so they are otherwise skipped.
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
+
+# Every extension with a dedicated branch in the dispatch loop below. Anything
+# outside this set takes the unknown-extension path, which announces the file
+# instead of dropping it. Keep in sync by construction, not by hand.
+HANDLED_EXTS = TEXT_EXTS | OFFICE_EXTS | IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS | {".pdf"}
 
 MIME_TYPES = {
     ".pdf": "application/pdf",
@@ -231,6 +258,67 @@ MIME_TYPES = {
     ".mkv": "video/x-matroska",
     ".avi": "video/x-msvideo",
 }
+
+# Bytes probed when deciding whether an unknown-extension file is text. Enough to
+# see a binary header without paying to read a large file twice.
+TEXT_SNIFF_BYTES = 8192
+# Cap on archive members listed. A manifest is context for grading "was the
+# bundle delivered and does it contain X", not a deliverable in its own right.
+MAX_ARCHIVE_ENTRIES = 200
+
+
+def _human_size(nbytes: int) -> str:
+    """``39466556`` -> ``37.6 MB (39,466,556 bytes)``; small sizes stay exact."""
+    size = float(nbytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{nbytes:,} bytes" if unit == "B" else f"{size:.1f} {unit} ({nbytes:,} bytes)"
+        size /= 1024
+    return f"{nbytes:,} bytes"
+
+
+def _sniffs_as_text(fpath: Path) -> bool:
+    """True if an unknown-extension file looks like text we can hand the judge.
+
+    An extension allowlist always lags reality -- a new framework, a ``Makefile``,
+    a ``Dockerfile``, an extensionless script -- so unrecognised files are decided
+    by content instead of by name. A NUL byte, or a meaningful density of
+    undecodable bytes and control characters, means binary.
+    """
+    try:
+        with fpath.open("rb") as fh:
+            chunk = fh.read(TEXT_SNIFF_BYTES)
+    except OSError:
+        return False
+    if not chunk or b"\x00" in chunk:
+        return False
+    text = chunk.decode("utf-8", errors="replace")
+    # A replacement char appears legitimately where the probe cut a multi-byte
+    # codepoint in half, so judge on density rather than on presence.
+    noise = text.count("\ufffd") + sum(1 for ch in text if ord(ch) < 32 and ch not in "\t\n\r\f\v")
+    return noise / len(text) < 0.01
+
+
+def _archive_manifest(fpath: Path) -> str | None:
+    """A listing of *fpath*'s members, or ``None`` if it is not a readable archive.
+
+    A ``.zip`` deliverable is opaque as bytes, and a judge told only that it exists
+    still cannot grade "the bundle contains X" -- which is what such rubrics ask.
+    The member list is the part of its content the criteria actually reference.
+    """
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(fpath) as zf:
+            infos = zf.infolist()
+    except Exception:
+        # Not a zip, truncated, or encrypted. The caller falls back to announcing
+        # the file by name and size, which is still better than silence.
+        return None
+    lines = [f"  {info.filename} ({info.file_size:,} bytes)" for info in infos[:MAX_ARCHIVE_ENTRIES]]
+    if len(infos) > MAX_ARCHIVE_ENTRIES:
+        lines.append(f"  ... and {len(infos) - MAX_ARCHIVE_ENTRIES:,} more entries")
+    return "\n".join(lines)
 
 
 def _convert_office_to_pdf(fpath: Path, out_dir: Path | None = None) -> Path | None:
@@ -436,7 +524,20 @@ def convert_deliverables_to_content_blocks(
     # the score. Max-min fair shares make a deliverable's allowance independent of
     # what it is called. Per-block overhead (header, truncation notice) is reserved
     # before allotting, because it is tokens too.
-    text_files = [p for p in entries if is_deliverable(p) and p.suffix.lower() in TEXT_EXTS]
+    # Files handed to the judge as text: a recognised text extension, or an
+    # unrecognised one whose content sniffs as text. Decided ONCE here so the
+    # allotment below and the dispatch loop cannot disagree -- a file emitted as
+    # text but missing from this list would be allotted nothing and truncated to
+    # zero characters, which is the same silence the else-branch exists to end.
+    texty = {
+        p
+        for p in entries
+        if is_deliverable(p)
+        and p not in sidecar_pdfs
+        and (p.suffix.lower() in TEXT_EXTS or (p.suffix.lower() not in HANDLED_EXTS and _sniffs_as_text(p)))
+    }
+
+    text_files = [p for p in entries if p in texty]
     body_budget = max(0, MAX_TOTAL_TEXT_BLOCK_CHARS - len(text_files) * TEXT_BLOCK_OVERHEAD_CHARS)
     allowance_by_name = dict(
         zip(
@@ -474,11 +575,16 @@ def convert_deliverables_to_content_blocks(
         ext = fpath.suffix.lower()
 
         try:
-            if ext in TEXT_EXTS:
+            if fpath in texty:
                 text = fpath.read_text(encoding="utf-8", errors="replace").strip()
                 if text:
                     block = _text_block(f"{fpath.name}:", text, allowance_by_name.get(fpath.name, 0))
                     blocks.append(block) if block else omitted_names.append(fpath.name)
+                else:
+                    # An empty file is a real outcome and the judge should grade it
+                    # as one -- but it must be told, or the file is indistinguishable
+                    # from one that was never written.
+                    blocks.append({"type": "text", "text": f"\n{fpath.name}: [present but EMPTY (0 bytes of content)]"})
 
             elif ext in OFFICE_EXTS:
                 # A preconversion pass may already have written a sibling PDF
@@ -571,12 +677,50 @@ def convert_deliverables_to_content_blocks(
                 # (images_and_text) need the standard video_url / input_audio types,
                 # which vLLM routes to the media tower.
                 is_video = ext in VIDEO_EXTS
+                file_type = "VIDEO" if is_video else "AUDIO"
                 if video_capable if is_video else audio_capable:
                     mime = MIME_TYPES.get(ext, "application/octet-stream")
                     data = fpath.read_bytes()
-                    file_type = "VIDEO" if is_video else "AUDIO"
                     blocks.append({"type": "text", "text": f"\n{fpath.name}:"})
                     blocks.append(_av_block(mime, data, ext=ext, file_type=file_type, openai_native=images_and_text))
+                else:
+                    # The gate is a capability limit, not an absence. Emitting
+                    # nothing made the judge assert the file was never produced: on
+                    # set A the five .wav tasks averaged 0.213 against 0.630 for
+                    # everything else, one graded "there is no actual .wav file
+                    # included" while a 39 MB .wav sat in the directory. Say the
+                    # file is there, and say why it cannot be played.
+                    verb = "watching" if is_video else "listening"
+                    blocks.append(
+                        {
+                            "type": "text",
+                            "text": (
+                                f"\n{fpath.name}: [{file_type} deliverable, {_human_size(fpath.stat().st_size)} "
+                                f"— present on disk, but this judge cannot decode {file_type.lower()}. "
+                                f"Do NOT treat it as missing or unproduced. Grade the criteria that do not "
+                                f"require {verb}; mark the rest unverifiable rather than unmet.]"
+                            ),
+                        }
+                    )
+
+            else:
+                # No handler for this extension. Before this branch existed the loop
+                # emitted nothing at all and the judge reported non-delivery -- "The
+                # required Northstar_DeltaFix_Bundle.zip is missing entirely" against
+                # an 8,357-byte file on disk. Whatever the allowlist above holds, an
+                # unrecognised deliverable must still be announced; silence must
+                # never be readable as absence.
+                size = fpath.stat().st_size
+                if size == 0:
+                    body = "[present but EMPTY (0 bytes)]"
+                else:
+                    manifest = _archive_manifest(fpath)
+                    if manifest is not None:
+                        body = f"[archive, {_human_size(size)} — present, NOT missing; contents:]\n{manifest}"
+                    else:
+                        body = f"[deliverable present, {_human_size(size)} — NOT missing; content not extractable in this format]"
+                block = _text_block(f"{fpath.name}:", body, MAX_TEXT_BLOCK_CHARS)
+                blocks.append(block) if block else omitted_names.append(fpath.name)
         except Exception as exc:
             blocks.append({"type": "text", "text": f"\n{fpath.name}: [Error: {exc}]"})
 
