@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import re
 from pathlib import Path
@@ -39,6 +40,14 @@ from resources_servers.gdpval.judge_panel import ResolvedJudge, merge_create_kwa
 # own parsed JSON, and a judge is free to put its own ``error`` field in there --
 # flagging on that would mark good judgements invalid.
 SCORING_ERROR_KEY = "scoring_error"
+
+# Judge requests on the rubric path had no timeout at all: AsyncOpenAI defaults to
+# 600 s with 2 silent retries, so a legitimately long request -- a multi-page PDF
+# rasterised to page images, say -- burns 30 minutes across three attempts and then
+# surfaces as a plain transient 500 with nothing indicating a timeout was involved.
+# Bound it explicitly, and do not retry: the retries multiply wall-clock without
+# changing the outcome, since a request too slow once is too slow three times.
+JUDGE_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("GDPVAL_JUDGE_REQUEST_TIMEOUT_SECONDS", "1800"))
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +136,12 @@ async def score_with_rubric(
         deliverable_text=deliverable_text,
     )
 
-    client = AsyncOpenAI(base_url=judge.base_url, api_key=judge.api_key)
+    client = AsyncOpenAI(
+        base_url=judge.base_url,
+        api_key=judge.api_key,
+        timeout=JUDGE_REQUEST_TIMEOUT_SECONDS,
+        max_retries=0,
+    )
 
     max_retries = 5
     base_delay = 2.0
@@ -285,7 +299,12 @@ async def score_with_rubric_visual(
     content: list[dict] = [{"type": "text", "text": judge_text}]
     content.extend(deliverable_content_blocks)
 
-    client = AsyncOpenAI(base_url=judge.base_url, api_key=judge.api_key)
+    client = AsyncOpenAI(
+        base_url=judge.base_url,
+        api_key=judge.api_key,
+        timeout=JUDGE_REQUEST_TIMEOUT_SECONDS,
+        max_retries=0,
+    )
 
     max_retries = 5
     base_delay = 2.0
@@ -426,7 +445,12 @@ async def score_with_rubric_structured(
     def _client_for(judge: ResolvedJudge) -> Any:
         key = (judge.base_url, judge.api_key)
         if key not in client_cache:
-            client_cache[key] = AsyncOpenAI(base_url=judge.base_url, api_key=judge.api_key)
+            client_cache[key] = AsyncOpenAI(
+        base_url=judge.base_url,
+        api_key=judge.api_key,
+        timeout=JUDGE_REQUEST_TIMEOUT_SECONDS,
+        max_retries=0,
+    )
         return client_cache[key]
 
     # Compute max possible score from rubric. Different upstream formats name
