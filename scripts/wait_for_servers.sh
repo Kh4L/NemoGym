@@ -13,6 +13,7 @@ set -euo pipefail
 NG_RUN_PID="${1:?Usage: wait_for_servers.sh <gym_env_start_pid> [head_server_port] [max_wait_seconds]}"
 HEAD_PORT="${2:-11000}"
 MAX_WAIT="${3:-180}"
+HEAD_MAX_WAIT="${HEAD_MAX_WAIT:-180}"
 
 HEAD_URL="http://127.0.0.1:${HEAD_PORT}"
 POLL_INTERVAL=2
@@ -28,7 +29,7 @@ check_pid() {
 # The head server has no root route, but /server_instances returns 200.
 echo "Waiting for head server on port ${HEAD_PORT}..."
 HEAD_READY="false"
-for i in $(seq 1 $((60 / POLL_INTERVAL))); do
+for i in $(seq 1 $((HEAD_MAX_WAIT / POLL_INTERVAL))); do
   if curl -sf "${HEAD_URL}/server_instances" > /dev/null 2>&1; then
     echo "Head server up after $((i * POLL_INTERVAL))s"
     HEAD_READY="true"
@@ -38,7 +39,7 @@ for i in $(seq 1 $((60 / POLL_INTERVAL))); do
   sleep "$POLL_INTERVAL"
 done
 if [ "$HEAD_READY" != "true" ]; then
-  echo "Head server did not respond within 60s"
+  echo "Head server did not respond within ${HEAD_MAX_WAIT}s"
   exit 1
 fi
 
