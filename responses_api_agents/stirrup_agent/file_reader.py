@@ -492,15 +492,29 @@ def convert_deliverables_to_content_blocks(
         if is_deliverable(entry) and entry.suffix.lower() in OFFICE_EXTS:
             office_stem_counts[entry.stem] = office_stem_counts.get(entry.stem, 0) + 1
 
-    # A sidecar render (``Plan.pptx.pdf``) is presented as part of its source
-    # Office file below, so it must not also be emitted as a standalone PDF --
-    # that would show the judge the same slides twice and invite double-counting
-    # against the rubric.
+    # A render presented as part of its source Office file must not ALSO be emitted
+    # as a standalone PDF -- that shows the judge the same pages twice and invites
+    # double-counting against the rubric. Both spellings the Office branch can
+    # consume have to be excluded:
+    #   sidecar  ``Plan.pptx.pdf``  -- written by preconvert for same-stem groups
+    #   sibling  ``Plan.pdf``       -- the ordinary case, used when the stem is
+    #                                  unambiguous, which is the COMMON path
+    # Listing only the sidecar left the sibling emitted twice for every ordinary
+    # Office deliverable: 100 image blocks where 50 were intended.
     sidecar_pdfs = {
         entry.with_name(entry.name + ".pdf")
         for entry in entries
         if is_deliverable(entry) and entry.suffix.lower() in OFFICE_EXTS
     }
+    consumed_pdfs = {
+        entry.with_suffix(".pdf")
+        for entry in entries
+        if is_deliverable(entry)
+        and entry.suffix.lower() in OFFICE_EXTS
+        and office_stem_counts.get(entry.stem, 0) == 1
+        and not entry.with_name(entry.name + ".pdf").is_file()
+    }
+    sidecar_pdfs |= consumed_pdfs
 
     # Allot the aggregate budget up front rather than first-come-first-served. Files
     # are visited in sorted order, so a spend-as-you-go budget would let two big

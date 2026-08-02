@@ -45,22 +45,30 @@ def test_find_convertible_files_picks_up_legacy(tmp_path: Path):
     (tmp_path / "b.ppt").write_bytes(b"\xd0\xcf\x11\xe0")
     (tmp_path / "c.txt").write_text("not office")
 
-    found = {p.name for p in find_convertible_files(tmp_path)}
+    found = {src.name for src, _dest in find_convertible_files(tmp_path)}
 
     assert found == {"a.docx", "b.ppt"}
 
 
-def test_same_stem_office_files_are_left_to_the_judging_path(tmp_path: Path):
-    """Both would convert to ``Report.pdf`` -- one racing the other in the thread pool.
+def test_same_stem_office_files_convert_to_injective_sidecars(tmp_path: Path):
+    """Both would convert to ``Report.pdf`` -- one racing the other for that name.
 
-    Observed once in the 200-task Mercor corpus
-    (``Pineloten_Capital_Structure.{docx,pptx}``): the single PDF present is the
-    .docx render (612x792 portrait), so the .pptx was silently never converted.
+    Observed in the 200-task Mercor corpus
+    (``Pineloten_Capital_Structure.{docx,pptx}``): the single PDF present was the
+    .docx render, so the .pptx was silently never converted and the judge saw one
+    file's content twice. Skipping them only moved the failure to judging time,
+    where libreoffice does not exist; they are now converted here to an injective
+    sidecar name instead.
     """
     (tmp_path / "Report.docx").write_bytes(b"PK\x03\x04")
     (tmp_path / "Report.pptx").write_bytes(b"PK\x03\x04")
     (tmp_path / "Unique.docx").write_bytes(b"PK\x03\x04")
 
-    found = {p.name for p in find_convertible_files(tmp_path)}
+    found = {src.name: dest for src, dest in find_convertible_files(tmp_path)}
 
-    assert found == {"Unique.docx"}, "ambiguous stems must not be preconverted"
+    assert set(found) == {"Report.docx", "Report.pptx", "Unique.docx"}
+    # The unambiguous one takes the ordinary sibling name (dest None = default).
+    assert found["Unique.docx"] is None
+    # The colliding pair each get their own name, so neither can overwrite the other.
+    assert found["Report.docx"].name == "Report.docx.pdf"
+    assert found["Report.pptx"].name == "Report.pptx.pdf"

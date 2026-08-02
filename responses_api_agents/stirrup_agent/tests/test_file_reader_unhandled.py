@@ -95,7 +95,11 @@ def test_legacy_office_is_treated_as_office_not_as_an_unknown_blob(tmp_path: Pat
     blocks = convert_deliverables_to_content_blocks(str(d), media_mode="native_pdf")
     joined = _text_of(blocks)
     assert "Deck.ppt" in joined
-    assert any(b.get("type") == "image_url" for b in blocks), "sibling PDF was not used"
+    # COUNT, not any(): the sibling PDF is consumed as the Office render, so it
+    # must not also be emitted standalone. `any()` passes with two copies, which
+    # is precisely the defect -- the judge shown the same pages twice.
+    assert sum(1 for b in blocks if b.get("type") == "image_url") == 1
+    assert "Deck.pdf" not in joined
 
 
 def test_handled_exts_is_derived_not_hand_maintained(tmp_path: Path):
