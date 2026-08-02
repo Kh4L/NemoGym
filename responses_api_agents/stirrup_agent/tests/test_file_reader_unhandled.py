@@ -14,6 +14,7 @@ absence.** Every deliverable is named, whatever its type.
 from pathlib import Path
 
 from responses_api_agents.stirrup_agent.file_reader import (
+    ARCHIVE_DOC_EXTS,
     HANDLED_EXTS,
     LEGACY_OFFICE_EXTS,
     OFFICE_EXTS,
@@ -142,3 +143,72 @@ def test_office_sidecar_is_not_also_emitted_standalone(tmp_path: Path):
     assert "Plan.pptx" in joined
     assert joined.count("Plan.pptx.pdf") == 0
     assert sum(1 for b in blocks if b.get("type") == "image_url") == 1
+
+
+def test_legacy_encoded_text_is_shown_not_withheld(tmp_path: Path):
+    """A cp1252 file is text. Judging it "binary" hides a real deliverable.
+
+    The known-extension path shows such bytes via errors="replace" without
+    hesitating, so the sniffed path must not be stricter than its own sibling.
+    """
+    d = tmp_path / "repeat_0"
+    d.mkdir()
+    # U+2019 and U+2013 encode to cp1252 bytes 0x92/0x96, which are invalid UTF-8
+    # but unambiguously text.
+    (d / "notes_legacy").write_bytes("Client\u2019s Q3 review \u2013 final".encode("cp1252"))
+
+    joined = _text_of(convert_deliverables_to_content_blocks(str(d), media_mode="images_and_text"))
+    assert "notes_legacy" in joined
+    assert "Client" in joined and "Q3 review" in joined, "legacy-encoded text was withheld"
+
+
+def test_zip_container_document_is_not_treated_as_an_archive(tmp_path: Path):
+    """.xlsm/.odt ARE zips. Listing their internals is not reading the document."""
+    import zipfile
+
+    d = tmp_path / "repeat_0"
+    d.mkdir()
+    with zipfile.ZipFile(d / "Model.xlsm", "w") as z:
+        z.writestr("[Content_Types].xml", "<Types/>")
+        z.writestr("xl/workbook.xml", "<workbook/>")
+
+    joined = _text_of(convert_deliverables_to_content_blocks(str(d), media_mode="images_and_text"))
+    assert "Model.xlsm" in joined
+    assert "[Content_Types].xml" not in joined, "OOXML internals leaked as a manifest"
+    assert "xl/workbook.xml" not in joined
+    assert ".xlsm" in ARCHIVE_DOC_EXTS
+
+
+def test_disclosure_blocks_count_against_the_text_budget(tmp_path: Path):
+    """Every text the judge receives must be budgeted, including our own notices.
+
+    Blocks appended directly bypassed the aggregate cap, so a directory of many
+    empty or undecodable files could grow the request without limit.
+    """
+    from responses_api_agents.stirrup_agent import file_reader as fr
+
+    d = tmp_path / "repeat_0"
+    d.mkdir()
+    for i in range(40):
+        (d / f"empty_{i:02d}.txt").write_text("")
+    (d / "clip.wav").write_bytes(b"RIFF" + b"\x00" * 512)
+
+    blocks = convert_deliverables_to_content_blocks(
+        str(d), media_mode="images_and_text", audio_capable=False
+    )
+    total = sum(len(b["text"]) for b in blocks if b.get("type") == "text")
+    assert total <= fr.MAX_TOTAL_TEXT_BLOCK_CHARS
+
+
+def test_both_text_paths_agree_on_what_is_readable(tmp_path: Path):
+    """`.ts` readable in one judging path and "[Binary file]" in the other is a bug."""
+    from responses_api_agents.stirrup_agent.file_reader import read_deliverable_files
+
+    d = tmp_path / "repeat_0"
+    d.mkdir()
+    (d / "auth.ts").write_text("export const token = 1;\n")
+
+    assert "export const token" in read_deliverable_files(str(d))
+    assert "export const token" in _text_of(
+        convert_deliverables_to_content_blocks(str(d), media_mode="images_and_text")
+    )

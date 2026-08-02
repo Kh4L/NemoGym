@@ -132,7 +132,10 @@ def read_deliverable_files(output_dir: str) -> str:
 
 def _extract_text(fpath: Path, ext: str) -> str:
     """Dispatch to the right extractor based on file extension."""
-    if ext in (".txt", ".md", ".csv", ".json", ".html", ".xml", ".log"):
+    # Same allowlist as the block path. Keeping a second, narrower tuple here made
+    # a `.ts` file readable in one judging path and "[Binary file: ...]" in the
+    # other, for the same deliverable.
+    if ext in TEXT_EXTS:
         return _read_text(fpath)
     elif ext == ".docx":
         return _read_docx(fpath)
@@ -257,6 +260,15 @@ MAX_ARCHIVE_ENTRIES = 200
 # members too, bounded, or a source archive is graded on the agent's prose alone.
 MAX_ARCHIVE_TEXT_CHARS = 120_000
 MAX_ARCHIVE_MEMBER_BYTES = 2_000_000
+# Document formats that happen to BE zip containers. Without this they open
+# cleanly as archives and the judge is handed a listing of OOXML/ODF internals
+# (`word/document.xml`, `[Content_Types].xml`) instead of the document. Announce
+# them by name and size like any other unreadable format.
+ARCHIVE_DOC_EXTS = {
+    ".xlsm", ".docm", ".pptm", ".xlsb",
+    ".odt", ".ods", ".odp", ".odg",
+    ".epub", ".jar", ".whl", ".apk", ".ipa",
+}
 
 
 def _human_size(nbytes: int) -> str:
@@ -285,8 +297,13 @@ def _sniffs_as_text(fpath: Path) -> bool:
         return False
     text = chunk.decode("utf-8", errors="replace")
     # The probe can cut a multi-byte codepoint in half, so judge on density.
-    noise = text.count("\ufffd") + sum(1 for ch in text if ord(ch) < 32 and ch not in "\t\n\r\f\v")
-    return noise / len(text) < 0.01
+    ctrl = sum(1 for ch in text if ord(ch) < 32 and ch not in "\t\n\r\f\v")
+    if (text.count("\ufffd") + ctrl) / len(text) < 0.01:
+        return True
+    # Not valid UTF-8 -- but a cp1252/latin-1 file is still text, and the known
+    # extension path would show it via errors="replace" without hesitating. Judge
+    # it on control characters alone, which every single-byte text encoding lacks.
+    return ctrl / len(text) < 0.01
 
 
 def _archive_manifest(fpath: Path) -> str | None:
@@ -296,6 +313,9 @@ def _archive_manifest(fpath: Path) -> str | None:
     so both the member list and the text members' content are returned.
     """
     import zipfile
+
+    if fpath.suffix.lower() in ARCHIVE_DOC_EXTS:
+        return None
 
     try:
         with zipfile.ZipFile(fpath) as zf:
@@ -613,8 +633,11 @@ def convert_deliverables_to_content_blocks(
                     blocks.append(block) if block else omitted_names.append(fpath.name)
                 else:
                     # An empty file is a real outcome, but the judge must be told,
-                    # or it is indistinguishable from one never written.
-                    blocks.append({"type": "text", "text": f"\n{fpath.name}: [present but EMPTY (0 bytes of content)]"})
+                    # or it is indistinguishable from one never written. Routed
+                    # through _text_block so it counts against the aggregate
+                    # budget like every other text the judge receives.
+                    block = _text_block(f"{fpath.name}:", "[present but EMPTY (0 bytes of content)]", 200)
+                    blocks.append(block) if block else omitted_names.append(fpath.name)
 
             elif ext in OFFICE_EXTS:
                 # A preconversion pass may already have written a sibling PDF
@@ -718,17 +741,14 @@ def convert_deliverables_to_content_blocks(
                     # nothing makes the judge report the file as never produced,
                     # so name it and say why it cannot be played.
                     verb = "watching" if is_video else "listening"
-                    blocks.append(
-                        {
-                            "type": "text",
-                            "text": (
-                                f"\n{fpath.name}: [{file_type} deliverable, {_human_size(fpath.stat().st_size)} "
-                                f"— present on disk, but this judge cannot decode {file_type.lower()}. "
-                                f"Do NOT treat it as missing or unproduced. Grade the criteria that do not "
-                                f"require {verb}; mark the rest unverifiable rather than unmet.]"
-                            ),
-                        }
+                    body = (
+                        f"[{file_type} deliverable, {_human_size(fpath.stat().st_size)} — present on disk, "
+                        f"but this judge cannot decode {file_type.lower()}. Do NOT treat it as missing or "
+                        f"unproduced. Grade the criteria that do not require {verb}; mark the rest "
+                        f"unverifiable rather than unmet.]"
                     )
+                    block = _text_block(f"{fpath.name}:", body, 400)
+                    blocks.append(block) if block else omitted_names.append(fpath.name)
 
             else:
                 # No handler for this extension. Whatever the allowlist above
