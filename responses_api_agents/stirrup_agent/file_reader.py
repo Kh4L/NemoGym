@@ -253,6 +253,10 @@ MIME_TYPES = {
 
 TEXT_SNIFF_BYTES = 8192
 MAX_ARCHIVE_ENTRIES = 200
+# A manifest says a bundle exists; rubrics ask what is IN it. Read the text
+# members too, bounded, or a source archive is graded on the agent's prose alone.
+MAX_ARCHIVE_TEXT_CHARS = 120_000
+MAX_ARCHIVE_MEMBER_BYTES = 2_000_000
 
 
 def _human_size(nbytes: int) -> str:
@@ -288,21 +292,51 @@ def _sniffs_as_text(fpath: Path) -> bool:
 def _archive_manifest(fpath: Path) -> str | None:
     """A listing of *fpath*'s members, or ``None`` if it is not a readable archive.
 
-    Rubrics ask whether a bundle contains X, so the member list is the part of an
-    archive's content the criteria actually reference.
+    Rubrics ask whether a bundle contains X and whether what is inside is correct,
+    so both the member list and the text members' content are returned.
     """
     import zipfile
 
     try:
         with zipfile.ZipFile(fpath) as zf:
             infos = zf.infolist()
+            lines = [f"  {info.filename} ({info.file_size:,} bytes)" for info in infos[:MAX_ARCHIVE_ENTRIES]]
+            if len(infos) > MAX_ARCHIVE_ENTRIES:
+                lines.append(f"  ... and {len(infos) - MAX_ARCHIVE_ENTRIES:,} more entries")
+
+            # Members are read IN MEMORY, never extracted. Nothing is written to
+            # disk, so there is no zip-slip path traversal to defend against and
+            # nothing to clean up. Bounded three ways: per-member size, aggregate
+            # characters, and the caller's own text budget.
+            bodies: list[str] = []
+            spent = 0
+            for info in infos:
+                if info.is_dir() or info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+                    continue
+                if Path(info.filename).suffix.lower() not in TEXT_EXTS:
+                    continue
+                if spent >= MAX_ARCHIVE_TEXT_CHARS:
+                    bodies.append("[archive text budget exhausted; remaining members listed above but not shown]")
+                    break
+                try:
+                    raw = zf.read(info)
+                except Exception:
+                    continue
+                text = raw.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                take = text[: MAX_ARCHIVE_TEXT_CHARS - spent]
+                spent += len(take)
+                truncated = "\n[...member truncated]" if len(take) < len(text) else ""
+                bodies.append(f"--- {info.filename} ---\n{take}{truncated}")
     except Exception:
         # Not a zip, truncated, or encrypted; caller falls back to name and size.
         return None
-    lines = [f"  {info.filename} ({info.file_size:,} bytes)" for info in infos[:MAX_ARCHIVE_ENTRIES]]
-    if len(infos) > MAX_ARCHIVE_ENTRIES:
-        lines.append(f"  ... and {len(infos) - MAX_ARCHIVE_ENTRIES:,} more entries")
-    return "\n".join(lines)
+
+    out = "\n".join(lines)
+    if bodies:
+        out += "\n\n" + "\n\n".join(bodies)
+    return out
 
 
 def _convert_office_to_pdf(fpath: Path, out_dir: Path | None = None) -> Path | None:

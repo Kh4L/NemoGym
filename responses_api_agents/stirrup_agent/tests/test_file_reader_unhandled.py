@@ -77,7 +77,28 @@ def test_zip_deliverable_lists_its_members(tmp_path: Path):
 
     joined = _text_of(convert_deliverables_to_content_blocks(str(d), media_mode="images_and_text"))
     assert "Bundle.zip" in joined
+    # the manifest...
     assert "fix/patch.diff" in joined and "fix/NOTES.md" in joined
+    # ...and the members' CONTENT. A judge told only that a bundle exists grades
+    # its contents from the agent's own prose, which is unverifiable credit.
+    assert "+++ b" in joined, "zip member content did not reach the judge"
+    assert "notes" in joined
+
+
+def test_zip_member_that_is_binary_is_listed_but_not_dumped(tmp_path: Path):
+    """Only text members are read; binary ones stay as manifest entries."""
+    import zipfile
+
+    d = tmp_path / "repeat_0"
+    d.mkdir()
+    with zipfile.ZipFile(d / "Mixed.zip", "w") as z:
+        z.writestr("readme.md", "hello world")
+        z.writestr("blob.bin", b"\x00\xff" * 2000)
+
+    joined = _text_of(convert_deliverables_to_content_blocks(str(d), media_mode="images_and_text"))
+    assert "readme.md" in joined and "hello world" in joined
+    assert "blob.bin" in joined          # named in the manifest
+    assert "\x00" not in joined          # but its bytes never dumped
 
 
 def test_legacy_office_is_treated_as_office_not_as_an_unknown_blob(tmp_path: Path):
