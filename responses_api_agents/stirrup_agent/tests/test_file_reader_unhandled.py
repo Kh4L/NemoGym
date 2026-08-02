@@ -3,18 +3,9 @@
 """A deliverable that reaches no handler must never be reported as nonexistent.
 
 ``convert_deliverables_to_content_blocks`` dispatches on file extension through a
-chain of ``if``/``elif``. With no ``else``, any extension without a branch emitted
-*nothing at all* -- and the judge, handed a deliverable list the file was simply
-absent from, graded it as never produced. ``invalid_judge_response`` stayed
-``false``, so nothing flagged it.
-
-Measured across 2,394 judged GDPVal rollouts / 6,200 deliverable files: **266
-files across 15 distinct tasks** emitted nothing -- ``.ts`` 143, ``.wav`` 48,
-``.zip`` 25, ``.ppt`` 12, ``.doc`` 6, ``.ipynb`` 6, ``.svg`` 6, extensionless 6,
-``.toml`` 6, ``.mp3`` 5. Those tasks averaged **0.1995** against **0.6401** for
-everything else. One shipped 31 files including 13 TypeScript modules and was
-graded *"contains only README.md, package.json... Missing: all 13 source
-modules"* -> 0.0103.
+chain of ``if``/``elif``. With no ``else``, an extension without a branch emitted
+nothing at all -- and the judge, handed a deliverable list the file was absent
+from, graded it as never produced, with ``invalid_judge_response`` still false.
 
 The invariant these tests defend is one line long: **silence must never read as
 absence.** Every deliverable is named, whatever its type.
@@ -90,13 +81,7 @@ def test_zip_deliverable_lists_its_members(tmp_path: Path):
 
 
 def test_legacy_office_is_treated_as_office_not_as_an_unknown_blob(tmp_path: Path):
-    """``.doc``/``.ppt``/``.xls`` must use the sibling PDF preconvert already wrote.
-
-    ``preconvert.py`` has always converted legacy Office (its
-    ``LEGACY_OFFICE_EXTENSIONS``), but ``OFFICE_EXTS`` here listed only OOXML --
-    so file_reader never looked for the rendered PDF sitting next to the file, and
-    the deliverable reached no handler at all.
-    """
+    """``.doc``/``.ppt``/``.xls`` must use the sibling PDF preconvert already wrote."""
     assert LEGACY_OFFICE_EXTS <= OFFICE_EXTS
     for ext in (".doc", ".ppt", ".xls"):
         assert ext in OFFICE_EXTS
@@ -114,12 +99,7 @@ def test_legacy_office_is_treated_as_office_not_as_an_unknown_blob(tmp_path: Pat
 
 
 def test_handled_exts_is_derived_not_hand_maintained(tmp_path: Path):
-    """The dispatch allowlist and the fallback test must not drift apart.
-
-    If ``HANDLED_EXTS`` were maintained by hand it would fall out of sync with the
-    branches, and a handled extension missing from it would take the unknown path
-    -- announced but never parsed.
-    """
+    """Derived, so the allowlist and the fallback test cannot drift apart."""
     assert TEXT_EXTS <= HANDLED_EXTS
     assert OFFICE_EXTS <= HANDLED_EXTS
     assert ".pdf" in HANDLED_EXTS
