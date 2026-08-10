@@ -1,6 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""NeMo Gym model server backed by SGLang's native ``/generate`` endpoint."""
+"""NeMo Gym model server for SGLang-served policies, preserving exact sampled token IDs.
+
+Two transports, both attaching `prompt_token_ids` / `generation_token_ids` /
+`generation_log_probs` to the assistant message for RL training:
+
+``transport: chat`` (default, **requires sglang >= 0.5.13**)
+    Drives SGLang's OpenAI-compatible ``/v1/chat/completions`` and asks for the training
+    metadata via the native ``return_meta_info`` / ``return_prompt_token_ids`` request
+    extensions (added by the TITO sync series; present in the 0.5.13 release tree -- no
+    patched build or fork required). Everything except the token extraction is inherited
+    from ``VLLMModel``, so prompt templating, tool-call parsing, sampling params, auth and
+    context-overflow handling are all done *server-side*. There is no local tokenizer that
+    can drift from the server's, and no client-side parser to keep in sync.
+
+``transport: generate``
+    Drives SGLang's native ``/generate`` with ``return_logprob=True``, rendering and
+    tokenizing the prompt locally. Required for builds/forks that predate chat-side TITO
+    (e.g. those serving diffusion LLMs). This path additionally keeps **multi-turn prompts
+    prefix-stable** by splicing the previous turn's exact sampled ids instead of
+    re-tokenizing history, and parses tool calls client-side since ``/generate`` returns
+    raw text.
+
+The pure request/response transforms live in `_logic.py`; tool-call parsing in
+`tool_parsers.py`. Both are unit-tested without a live server.
+"""
 
 import json
 import re
@@ -11,15 +35,19 @@ from uuid import uuid4
 
 from aiohttp.client_exceptions import ClientResponseError
 from fastapi import Request
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from nemo_gym.base_responses_api_model import Body
 from nemo_gym.openai_utils import (
+    NeMoGymAsyncOpenAI,
     NeMoGymChatCompletion,
     NeMoGymChatCompletionCreateParamsNonStreaming,
 )
 from nemo_gym.server_utils import SESSION_ID_KEY, is_nemo_gym_fastapi_entrypoint
-from responses_api_models.sglang_model._logic import extract_generated_tokens_and_logprobs
+from responses_api_models.sglang_model._logic import (
+    extract_generated_tokens_and_logprobs,
+    unsupported_sampling_params,
+)
 from responses_api_models.sglang_model.tool_parsers import (
     normalize_tool_call_arguments,
     parse_qwen3_coder_tool_calls,
@@ -27,14 +55,42 @@ from responses_api_models.sglang_model.tool_parsers import (
 from responses_api_models.vllm_model.app import VLLMModel, VLLMModelConfig
 
 
+# Chat-side TITO (`return_meta_info` / `return_prompt_token_ids` on /v1/chat/completions)
+# landed in the sglang-miles sync series and is present in the 0.5.13 release tree.
+MIN_SGLANG_VERSION_FOR_CHAT_TRANSPORT = "0.5.13"
+
+
 class SGLangModelConfig(VLLMModelConfig):
     """Configuration for exact-token SGLang generation."""
 
-    context_length: int = Field(gt=0)
+    # `chat` requires sglang >= 0.5.13. `generate` works on any build but tokenizes locally.
+    transport: Literal["chat", "generate"] = "chat"
+
+    # --- `generate` transport only (unused when transport == "chat") ---
+    # Required for `generate`: the server enforces no limit on a pre-tokenized prompt, so the
+    # adapter must. `chat` needs no value -- SGLang applies its own limit and the inherited
+    # overflow handling recognizes the error.
+    context_length: Optional[int] = Field(default=None, gt=0)
     trust_remote_code: bool = False
     sglang_chat_template: Optional[str] = None
     sglang_chat_template_path: Optional[str] = None
     sglang_tool_format: Literal["hermes", "qwen3_coder"] = "hermes"
+    # End-of-turn markers stripped from generated text before parsing, and the end-of-turn
+    # sequence appended when splicing a turn into the cached prefix. Defaults are ChatML
+    # (Qwen etc.); a model whose template uses different markers MUST override both, or the
+    # splice will emit a malformed turn boundary.
+    sglang_eos_markers: List[str] = Field(default_factory=lambda: ["<|im_end|>", "<|endoftext|>"])
+    sglang_turn_suffix: str = "<|im_end|>\n"
+
+    @model_validator(mode="after")
+    def _validate_transport_requirements(self) -> "SGLangModelConfig":
+        if self.transport == "generate" and self.context_length is None:
+            raise ValueError(
+                "context_length is required when transport='generate': the prompt is tokenized "
+                "locally and sent as input_ids, so this server must enforce the window itself. "
+                "Set it to the SGLang server's max total sequence length."
+            )
+        return self
 
 
 class SGLangModel(VLLMModel):
@@ -50,7 +106,6 @@ class SGLangModel(VLLMModel):
         r'"arguments"\s*:\s*(.*)\}\s*$',
         re.DOTALL,
     )
-    _SGLANG_EOS_MARKERS: ClassVar = ("<|im_end|>", "<|endoftext|>")
 
     def _post_init(self) -> None:
         super()._post_init()
@@ -82,11 +137,74 @@ class SGLangModel(VLLMModel):
         request: Request,
         body: NeMoGymChatCompletionCreateParamsNonStreaming = Body(),
     ) -> NeMoGymChatCompletion:
-        """Generate without applying the vLLM-specific request preprocessing."""
+        if self.config.transport == "chat":
+            # Inherit the whole vLLM path; only token extraction differs (see
+            # `_attach_token_id_information`).
+            return await super().chat_completions(request, body)
+        # `/generate` needs a pre-tokenized prompt, so it deliberately bypasses the
+        # vLLM-specific request preprocessing and renders locally instead.
         return await self._sglang_chat_completion(
             request,
             body.model_dump(exclude_unset=True),
         )
+
+    # ------------------------------------------------------------------
+    # `chat` transport: inherit everything, override only token extraction
+    # ------------------------------------------------------------------
+
+    def _preprocess_chat_completion_create_params(self, request: Request, body_dict: Dict[str, Any]) -> Dict[str, Any]:
+        body_dict = super()._preprocess_chat_completion_create_params(request, body_dict)
+        if self.config.transport == "chat" and self.config.return_token_id_information:
+            # vLLM-only knob: SGLang has no `token_id:NNN` logprob encoding, and leaving it
+            # set would be a silent no-op that misrepresents where the ids come from.
+            body_dict.pop("return_tokens_as_token_ids", None)
+            # SGLang's native request extensions for the training metadata.
+            body_dict["return_meta_info"] = True
+            body_dict["return_prompt_token_ids"] = True
+        return body_dict
+
+    async def _attach_token_id_information(
+        self, choice_dict: Dict[str, Any], body_dict: Dict[str, Any], client: NeMoGymAsyncOpenAI
+    ) -> None:
+        """Read the ids/logprobs SGLang already returned, instead of vLLM's `token_id:` parse.
+
+        No `/tokenize` round-trip is needed: `return_prompt_token_ids` makes SGLang report the
+        prompt ids it actually tokenized, which is authoritative in a way a local tokenizer
+        cannot be.
+        """
+        # An aborted generation is a truncated fragment, not a completion. Emitting it would
+        # put a poisoned rollout into the training batch looking like a normal `stop`.
+        if choice_dict.get("finish_reason") == "abort":
+            raise RuntimeError(
+                f"`{self.config.name}`: SGLang reported finish_reason='abort' (generation was "
+                "cancelled server-side, e.g. preemption or shutdown). Refusing to emit a "
+                "partial rollout as a completed one."
+            )
+
+        generation_token_ids, generation_log_probs = extract_generated_tokens_and_logprobs(choice_dict)
+
+        prompt_token_ids: Optional[List[int]] = choice_dict.get("prompt_token_ids")
+        if prompt_token_ids is None:
+            raise RuntimeError(
+                f"`{self.config.name}` requested prompt token ids from SGLang "
+                "(return_token_id_information=True, so return_prompt_token_ids=True was sent), "
+                f"but the response carried none (choice keys={sorted(choice_dict)}). "
+                f"transport='chat' requires sglang >= {MIN_SGLANG_VERSION_FOR_CHAT_TRANSPORT}; "
+                "use transport='generate' for older builds."
+            )
+
+        choice_dict["message"].update(
+            dict(
+                prompt_token_ids=[int(token_id) for token_id in prompt_token_ids],
+                generation_token_ids=generation_token_ids,
+                generation_log_probs=generation_log_probs,
+            )
+        )
+
+        # Clean the duplicated / non-OpenAI fields so the response validates.
+        choice_dict.pop("logprobs", None)
+        choice_dict.pop("prompt_token_ids", None)
+        choice_dict.pop("meta_info", None)
 
     def _full_sglang_tokenize(
         self,
@@ -112,9 +230,15 @@ class SGLangModel(VLLMModel):
         return [int(token_id) for token_id in encoded]
 
     def _sglang_eos_nl(self) -> List[int]:
+        """Token ids of the end-of-turn sequence appended when splicing a turn.
+
+        Driven by `sglang_turn_suffix` rather than hardcoded ChatML, because a model whose
+        template closes a turn differently would otherwise get a malformed turn boundary
+        spliced into every multi-turn prompt.
+        """
         if self._sglang_eos_nl_ids is None:
             encoded = self._get_sglang_tokenizer()(
-                "<|im_end|>\n",
+                self.config.sglang_turn_suffix,
                 add_special_tokens=False,
             )
             self._sglang_eos_nl_ids = [int(token_id) for token_id in encoded["input_ids"]]
@@ -403,9 +527,17 @@ class SGLangModel(VLLMModel):
         else:
             max_new_tokens = min(max_new_tokens, remaining_context)
         sampling_params["max_new_tokens"] = max_new_tokens
-        for key in ("temperature", "top_p", "top_k", "stop"):
+        for key in ("temperature", "top_p", "top_k", "stop", "frequency_penalty", "repetition_penalty", "min_p"):
             if body_dict.get(key) is not None:
                 sampling_params[key] = body_dict[key]
+        ignored = unsupported_sampling_params(body_dict)
+        if ignored:
+            print(
+                f"[sglang_model] transport='generate' cannot honor {ignored}; the realized "
+                "sampling distribution will differ from the configured recipe. Use "
+                "transport='chat' (sglang >= 0.5.13) for full parameter support.",
+                flush=True,
+            )
 
         try:
             result = await client.create_generate(
@@ -452,7 +584,7 @@ class SGLangModel(VLLMModel):
         while stripped:
             stripped = False
             generated_text = generated_text.rstrip("\n")
-            for eos_marker in self._SGLANG_EOS_MARKERS:
+            for eos_marker in self.config.sglang_eos_markers:
                 if generated_text.endswith(eos_marker):
                     generated_text = generated_text[: -len(eos_marker)]
                     stripped = True
@@ -464,6 +596,14 @@ class SGLangModel(VLLMModel):
         finish = meta_info.get("finish_reason")
         if isinstance(finish, dict):
             finish = finish.get("type")
+        if finish == "abort":
+            # A truncated fragment, not a completion. Reporting it as `stop` would put a
+            # poisoned rollout into the training batch looking like a normal turn.
+            raise RuntimeError(
+                f"`{self.config.name}`: SGLang reported finish_reason='abort' (generation was "
+                "cancelled server-side, e.g. preemption or shutdown). Refusing to emit a "
+                "partial rollout as a completed one."
+            )
         if finish == "length":
             finish_reason = "length"
         elif tool_calls:

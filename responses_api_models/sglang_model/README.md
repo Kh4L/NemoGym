@@ -4,13 +4,39 @@ This Responses-API model server connects NeMo Gym to an SGLang server managed
 outside Gym. It preserves the exact prompt IDs, sampled token IDs, and sampled
 token logprobs required by token-level RL training.
 
-The adapter currently renders the chat template locally and calls SGLang's
-native `/generate` endpoint with `return_logprob=true`. Gym's public
-Chat-Completions response contract does not guarantee exact sampled integer
-token IDs, so moving this transport to `/v1/chat/completions` would currently
-lose a required training invariant. If that endpoint gains a stable
-token-ID/logprob contract, the transport can change without changing the
-session-splice or context-overflow rules below.
+## Transports
+
+### `transport: chat` (default) — requires **sglang >= 0.5.13**
+
+Drives SGLang's OpenAI-compatible `/v1/chat/completions`, requesting the training
+metadata through SGLang's native `return_meta_info` / `return_prompt_token_ids`
+extensions. Token IDs and logprobs come back on each choice as
+`meta_info.output_token_logprobs` and `prompt_token_ids`.
+
+This is the stable token-ID/logprob contract the `/generate` path was written to
+wait for: it landed with the sglang-miles TITO sync series
+([sgl-project/sglang#23751](https://github.com/sgl-project/sglang/pull/23751), merged
+before the 0.5.13 cut) and is in the released tree, so **no patched build or fork is
+required**.
+
+Prefer it whenever the server supports it. Only token extraction is overridden, so
+prompt templating, **tool-call parsing**, sampling parameters, auth, and
+context-overflow handling are all done server-side — there is no local tokenizer that
+can drift from the server's, and no client-side tool parser to keep in sync.
+
+### `transport: generate` — for builds without chat-side TITO
+
+Renders the chat template locally and calls SGLang's native `/generate` with
+`return_logprob=true`. Required for forks that predate the TITO series (for example
+those serving diffusion LLMs). This path carries the session-splice and
+context-overflow rules below, and parses tool calls client-side because `/generate`
+returns raw text.
+
+In both transports, a generation SGLang reports as `finish_reason="abort"` raises
+rather than being emitted, so a server-cancelled partial cannot enter a training
+batch looking like a completed turn.
+
+## Multi-turn session splicing (`generate` transport)
 
 For a multi-turn session, the adapter caches the token sequence and splices
 each prior assistant turn's exact sampled IDs into the next prompt. It never
@@ -28,18 +54,33 @@ same worker.
 
 See `configs/sglang_model_for_training.yaml`.
 
-- `base_url`: the SGLang URL; either a bare server URL or one ending in `/v1`.
+See `configs/sglang_model_for_training.yaml` (chat) and
+`configs/sglang_model_for_training_generate.yaml` (generate).
+
+- `transport`: `chat` (default) or `generate`.
+- `base_url`: for `chat` it must end in `/v1`, exactly like `vllm_model`. For
+  `generate` either form works — `create_generate` strips a trailing `/v1` itself.
 - `model`: a tokenizer/model identifier available to the Gym server.
-- `context_length`: the SGLang server's total context limit.
+
+Everything below applies to `transport: generate` only; on the chat path SGLang
+owns these concerns.
+
+- `context_length`: **required** for `generate` — the SGLang server's total context
+  limit. A locally tokenized prompt is unbounded unless this server bounds it, so
+  the example config leaves it mandatory (`???`) rather than defaulting, so a
+  mismatched limit cannot be selected silently. Unused (and unset) for `chat`.
 - `sglang_chat_template`: optional inline copy of the server/training template.
 - `sglang_chat_template_path`: optional path to the exact server chat template.
 - `sglang_tool_format`: `hermes` or `qwen3_coder`.
-- `trust_remote_code`: forwarded to the local tokenizer loader; defaults to
-  `false`.
+- `sglang_eos_markers` / `sglang_turn_suffix`: end-of-turn markers, defaulting to
+  ChatML. A model whose template closes turns differently **must** override both, or
+  the splice writes a malformed turn boundary into every follow-up prompt.
+- `trust_remote_code`: forwarded to the local tokenizer loader; defaults to `false`.
 
-The leaf package pins `transformers==5.6.0`, matching NeMo RL's SGLang worker
-environment. The example config leaves `context_length` mandatory (`???`) so a
-mismatched server limit cannot be selected silently.
+The leaf package pins `transformers`, matching NeMo RL's SGLang worker environment,
+because this path renders the template and tokenizes locally — a tokenizer or
+template delta between adapter and server surfaces as a rollout contiguity failure
+rather than an import error.
 
 ## CPU-only tests
 

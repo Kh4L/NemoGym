@@ -5,6 +5,18 @@
 from typing import Any, Dict, List, Tuple
 
 
+# Sampling params the ``/generate`` transport cannot honor. Reported so a caller never
+# silently gets a different sampling distribution than the one their recipe configured --
+# which would be invisible in the training data. The ``chat`` transport forwards everything
+# to SGLang's OpenAI endpoint verbatim and so needs no such list.
+_UNSUPPORTED_SAMPLING_PARAMS = ("n", "seed", "response_format", "logit_bias", "presence_penalty")
+
+
+def unsupported_sampling_params(body_dict: Dict[str, Any]) -> List[str]:
+    """Names of request params the ``/generate`` transport will drop, for a loud warning."""
+    return [key for key in _UNSUPPORTED_SAMPLING_PARAMS if body_dict.get(key) is not None]
+
+
 def _extract_output_ids(
     result: Dict[str, Any],
     meta: Dict[str, Any],

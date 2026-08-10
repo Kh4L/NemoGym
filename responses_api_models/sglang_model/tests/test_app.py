@@ -69,6 +69,8 @@ def make_model(
     context_length: int = 64,
     tokenizer: FakeTokenizer | None = None,
     client: FakeSGLangClient | None = None,
+    transport: str = "generate",
+    **config_overrides,
 ) -> SGLangModel:
     config = SGLangModelConfig(
         host="0.0.0.0",
@@ -78,9 +80,11 @@ def make_model(
         base_url="http://localhost:30000/v1",
         api_key="unused",  # pragma: allowlist secret
         model="local-tokenizer",
+        transport=transport,
         context_length=context_length,
         return_token_id_information=True,
         uses_reasoning_parser=True,
+        **config_overrides,
     )
     model = SGLangModel(
         config=config,
@@ -321,3 +325,119 @@ def test_inline_chat_template_is_used_directly() -> None:
     model.config.sglang_chat_template_path = "/must/not/be/read"
 
     assert model._get_sglang_chat_template() == "inline-template"
+
+
+# ---------------------------------------------------------------------------
+# transport="chat": inherits the vLLM path, overrides only token extraction
+# ---------------------------------------------------------------------------
+
+
+def _chat_choice(**overrides):
+    """An SGLang >= 0.5.13 chat choice with the native TITO extensions populated."""
+    choice = {
+        "index": 0,
+        "finish_reason": "stop",
+        "message": {"role": "assistant", "content": "the answer"},
+        "prompt_token_ids": [1, 2, 3],
+        "meta_info": {"output_token_logprobs": [[-0.5, 10, "a"], [-0.25, 11, "b"]]},
+        "logprobs": {"content": [{"token": "a", "logprob": -0.5}]},
+    }
+    choice.update(overrides)
+    return choice
+
+
+def test_chat_transport_needs_no_context_length() -> None:
+    """SGLang enforces its own window on the chat path, so the knob is generate-only."""
+    model = make_model(transport="chat", context_length=None)
+    assert model.config.context_length is None
+
+
+def test_generate_transport_requires_context_length() -> None:
+    """A locally tokenized prompt is unbounded unless this server bounds it."""
+    with pytest.raises(ValueError, match="context_length is required"):
+        make_model(transport="generate", context_length=None)
+
+
+def test_chat_preprocess_requests_sglang_tito_extensions() -> None:
+    model = make_model(transport="chat", context_length=None)
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+
+    out = model._preprocess_chat_completion_create_params(MagicMock(), body)
+
+    assert out["return_meta_info"] is True
+    assert out["return_prompt_token_ids"] is True
+    # vLLM's `token_id:NNN` encoding does not exist on SGLang; leaving it set would be a
+    # silent no-op that misrepresents where the ids come from.
+    assert "return_tokens_as_token_ids" not in out
+    # ...and the inherited behavior is still in force.
+    assert out["logprobs"] is True
+    assert out["model"] == "local-tokenizer"
+
+
+def test_chat_preprocess_honors_per_request_chat_template_kwargs() -> None:
+    """Per-sample overrides must survive; dropping them renders the wrong template."""
+    model = make_model(transport="chat", context_length=None, chat_template_kwargs={"enable_thinking": False})
+    body = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": {"chat_template_kwargs": '{"enable_thinking": true}'},
+    }
+
+    out = model._preprocess_chat_completion_create_params(MagicMock(), body)
+
+    assert out["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+@pytest.mark.asyncio
+async def test_chat_attach_reads_native_ids_and_logprobs() -> None:
+    model = make_model(transport="chat", context_length=None)
+    choice = _chat_choice()
+
+    await model._attach_token_id_information(choice, {}, MagicMock())
+
+    assert choice["message"]["prompt_token_ids"] == [1, 2, 3]
+    assert choice["message"]["generation_token_ids"] == [10, 11]
+    assert choice["message"]["generation_log_probs"] == [-0.5, -0.25]
+    # Non-OpenAI / duplicated fields are stripped so the response validates.
+    for key in ("logprobs", "prompt_token_ids", "meta_info"):
+        assert key not in choice
+
+
+@pytest.mark.asyncio
+async def test_chat_attach_rejects_aborted_generation() -> None:
+    """An abort is a truncated fragment; it must not enter a batch as a `stop`."""
+    model = make_model(transport="chat", context_length=None)
+
+    with pytest.raises(RuntimeError, match="abort"):
+        await model._attach_token_id_information(_chat_choice(finish_reason="abort"), {}, MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_chat_attach_errors_when_server_predates_chat_tito() -> None:
+    """Older SGLang ignores the extensions; say so instead of emitting empty token ids."""
+    model = make_model(transport="chat", context_length=None)
+    choice = _chat_choice()
+    choice.pop("prompt_token_ids")
+
+    with pytest.raises(RuntimeError, match="0.5.13"):
+        await model._attach_token_id_information(choice, {}, MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_generate_transport_rejects_aborted_generation() -> None:
+    """Same guarantee on the /generate path, where SGLang reports abort in meta_info."""
+    tokenizer = FakeTokenizer(full_prompt_ids=[1, 2, 3])
+    client = FakeSGLangClient(
+        {
+            "meta_info": {
+                "finish_reason": {"type": "abort"},
+                "output_token_logprobs": [[-0.5, 10, "a"]],
+            }
+        }
+    )
+    model = make_model(tokenizer=tokenizer, client=client)
+
+    with pytest.raises(RuntimeError, match="abort"):
+        await model._sglang_chat_completion(
+            SimpleNamespace(session={}),
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
