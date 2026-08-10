@@ -137,12 +137,14 @@ class SGLangModel(VLLMModel):
         request: Request,
         body: NeMoGymChatCompletionCreateParamsNonStreaming = Body(),
     ) -> NeMoGymChatCompletion:
+        """Generate without applying the vLLM-specific request preprocessing.
+
+        That applies to ``transport="generate"``, which needs a pre-tokenized prompt and so
+        renders locally. ``transport="chat"`` instead inherits the whole vLLM path and
+        differs only in token extraction -- see ``_attach_token_id_information``.
+        """
         if self.config.transport == "chat":
-            # Inherit the whole vLLM path; only token extraction differs (see
-            # `_attach_token_id_information`).
             return await super().chat_completions(request, body)
-        # `/generate` needs a pre-tokenized prompt, so it deliberately bypasses the
-        # vLLM-specific request preprocessing and renders locally instead.
         return await self._sglang_chat_completion(
             request,
             body.model_dump(exclude_unset=True),
