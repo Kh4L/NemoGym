@@ -1,0 +1,32 @@
+# SGLang-backed policy model server, native /generate transport.
+#
+# Use this when the SGLang build/fork predates chat-side TITO (< 0.5.13), e.g. a fork
+# serving a diffusion LLM. Prefer configs/sglang_model_for_training.yaml otherwise.
+#
+# This path renders and tokenizes the prompt locally, then POSTs input_ids. It keeps
+# multi-turn prompts prefix-stable by splicing the previous turn's exact sampled ids rather
+# than re-tokenizing history, and parses tool calls client-side (/generate returns raw text).
+#
+# `base_url` may be the bare server url or end in /v1 -- `create_generate` strips the suffix.
+#
+# `model` MUST be the exact path/revision the SGLang server was launched with: the prompt is
+# tokenized by a LOCAL copy of the tokenizer and chat template, so any delta shows up as a
+# rollout contiguity failure rather than an error.
+policy_model:
+  responses_api_models:
+    sglang_model:
+      entrypoint: app.py
+      transport: generate
+      base_url: ${policy_base_url}
+      api_key: ${policy_api_key}
+      model: ${policy_model_name}
+      # Required for this transport: set to the SGLang server's max total sequence length.
+      context_length: ???
+      return_token_id_information: true
+      uses_reasoning_parser: true
+      # "hermes" (<tool_call>{json}</tool_call>) or "qwen3_coder" (<function=...> XML).
+      sglang_tool_format: hermes
+      # End-of-turn markers. Defaults are ChatML; a model whose template closes turns
+      # differently MUST override both, or the splice emits a malformed turn boundary.
+      # sglang_eos_markers: ["<|im_end|>", "<|endoftext|>"]
+      # sglang_turn_suffix: "<|im_end|>\n"
