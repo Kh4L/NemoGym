@@ -1059,7 +1059,7 @@ async def test_sampling_overrides_win_last_but_cannot_exceed_context(max_overrid
         sampling_overrides={"temperature": 0.8, "top_p": 0.9, "top_k": 50, "max_tokens": max_override, "seed": 9},
     )
     await model.chat_completions(
-        SimpleNamespace(session={}),
+        SimpleNamespace(session={SESSION_ID_KEY: "sampling-overrides"}),
         NeMoGymChatCompletionCreateParamsNonStreaming(
             messages=[{"role": "user", "content": "hi"}],
             temperature=0.5,
