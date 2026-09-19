@@ -1334,6 +1334,15 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
         await self._raise_for_status(response, request_kwargs)
         return await get_response_json(response)
 
+    async def create_generate(self, **kwargs):
+        """Call SGLang's native endpoint through the shared authenticated HTTP client."""
+        base_url = self.base_url.rstrip("/").removesuffix("/v1")
+        request_kwargs = dict(url=f"{base_url}/generate", json=kwargs)
+        response = await self._request(method="POST", **request_kwargs)
+
+        await self._raise_for_status(response, request_kwargs)
+        return await get_response_json(response)
+
     async def create_tokenize(self, **kwargs):
         base_url = self.base_url.removesuffix("/v1")
         request_kwargs = dict(
