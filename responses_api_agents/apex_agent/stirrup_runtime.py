@@ -8,15 +8,18 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import logging
 import os
 import shutil
 import time
 import zipfile
-from contextlib import suppress
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, get_args, get_origin
+from urllib.parse import urlsplit, urlunsplit
 
 
 LOGGER = logging.getLogger(__name__)
@@ -78,6 +81,23 @@ def truncate_tool_text(text: str) -> str:
     removed = len(text) - excerpt_characters
     marker = f"\n\n[... {removed} characters truncated ...]\n\n"
     return text[:TOOL_OUTPUT_HEAD_CHARACTERS] + marker + text[-TOOL_OUTPUT_TAIL_CHARACTERS:]
+
+
+def context_window_client(client_class: Any, context_window_tokens: int) -> Any:
+    """Subclass a Stirrup client so context summarization uses the policy's real context window.
+
+    Stirrup 0.1 uses the client's ``max_tokens`` argument both as each request's ``max_completion_tokens`` and, via
+    the ``max_tokens`` property, as the context window whose 70% triggers summarization. The runner passes
+    ``max_output_tokens`` there, so without this override summarization starts at ~70% of the output cap. The
+    subclass keeps the output cap on requests and changes only the property the agent reads.
+    """
+
+    class ContextWindowClient(client_class):
+        @property
+        def max_tokens(self) -> int:
+            return context_window_tokens
+
+    return ContextWindowClient
 
 
 def mcp_call_arguments(params: Any) -> dict[str, Any]:
@@ -316,6 +336,36 @@ def annotate_schema_ref_types(schema: Any) -> Any:
         return annotate(schema)
     except Exception:
         return schema
+
+
+def install_json_schema_to_pydantic_array_items_patch() -> None:
+    """Allow MCP schemas to use JSON Schema's implicit unconstrained array items."""
+    import json_schema_to_pydantic
+
+    current_create_model = json_schema_to_pydantic.create_model
+    if getattr(current_create_model, "_apex_array_items_patch", False):
+        patched_create_model = current_create_model
+    else:
+        original_create_model = current_create_model
+        signature = inspect.signature(original_create_model)
+
+        def create_model_with_undefined_array_items(*args: Any, **kwargs: Any) -> Any:
+            bound = signature.bind_partial(*args, **kwargs)
+            if not bound.arguments.get("allow_undefined_array_items"):
+                bound.arguments["allow_undefined_array_items"] = True
+            return original_create_model(*bound.args, **bound.kwargs)
+
+        create_model_with_undefined_array_items._apex_array_items_patch = True
+        patched_create_model = create_model_with_undefined_array_items
+        json_schema_to_pydantic.create_model = patched_create_model
+
+    with suppress(Exception):
+        import stirrup.tools.mcp as stirrup_mcp
+
+        if hasattr(stirrup_mcp, "create_model") and not getattr(
+            stirrup_mcp.create_model, "_apex_array_items_patch", False
+        ):
+            stirrup_mcp.create_model = patched_create_model
 
 
 # GLM-family vLLM tool-call parsers reconstruct each argument's type from the
@@ -1107,6 +1157,144 @@ def restore_apex_state(
     return {"active_tools": restored_tools, "todos": len(todo_state)}
 
 
+# ---------------------------------------------------------------------------
+# Policy egress relay. A sandbox that runs in its own network namespace
+# (apptainer --net --network none, used so worlds with fixed service ports can
+# share a node) has no route to the model server. The host binds a unix socket
+# into the sandbox; unix sockets ignore network namespaces. Inside, a loopback
+# listener forwards to that socket and the Chat Completions client points at
+# the listener. Both halves live here so every entrypoint that calls
+# run_stirrup_rollout gets the relay.
+# ---------------------------------------------------------------------------
+_RELAY_CHUNK_BYTES = 65536
+_RELAY_CONNECT_TIMEOUT_SECONDS = 5.0
+_RELAY_CLOSE_TIMEOUT_SECONDS = 1.0
+
+
+async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        while True:
+            data = await reader.read(_RELAY_CHUNK_BYTES)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (OSError, asyncio.IncompleteReadError):
+        pass
+    finally:
+        with suppress(Exception):
+            if writer.can_write_eof():
+                writer.write_eof()
+
+
+async def _bridge(
+    downstream: tuple[asyncio.StreamReader, asyncio.StreamWriter],
+    upstream: tuple[asyncio.StreamReader, asyncio.StreamWriter],
+) -> None:
+    try:
+        await asyncio.gather(_pump(downstream[0], upstream[1]), _pump(upstream[0], downstream[1]))
+    finally:
+        for writer in (downstream[1], upstream[1]):
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
+
+
+class RelayServer:
+    """An asyncio server whose in-flight bridges are cancelled on close.
+
+    ``Server.wait_closed`` waits for every accepted connection to finish, and the
+    Chat Completions client keeps idle keep-alive connections open, so closing
+    must cancel the bridges instead of waiting for them.
+    """
+
+    def __init__(self) -> None:
+        self._server: asyncio.AbstractServer | None = None
+        self._bridges: set[asyncio.Task[None]] = set()
+
+    def track(self, task: asyncio.Task[None]) -> None:
+        self._bridges.add(task)
+        task.add_done_callback(self._bridges.discard)
+
+    def attach(self, server: asyncio.AbstractServer) -> None:
+        self._server = server
+
+    @property
+    def port(self) -> int:
+        assert self._server is not None and self._server.sockets
+        return self._server.sockets[0].getsockname()[1]
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+        for task in list(self._bridges):
+            task.cancel()
+        if self._bridges:
+            await asyncio.gather(*self._bridges, return_exceptions=True)
+        if self._server is not None:
+            with suppress(Exception):
+                await asyncio.wait_for(self._server.wait_closed(), _RELAY_CLOSE_TIMEOUT_SECONDS)
+
+
+def _relay_handler(relay: RelayServer, connect: Any) -> Any:
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            relay.track(task)
+        try:
+            upstream = await asyncio.wait_for(connect(), _RELAY_CONNECT_TIMEOUT_SECONDS)
+        except (OSError, asyncio.TimeoutError):
+            writer.close()
+            return
+        await _bridge((reader, writer), upstream)
+
+    return handler
+
+
+async def serve_unix_to_tcp(socket_path: str, host: str, port: int) -> RelayServer:
+    """Host side: accept on a unix socket and forward each connection to ``host:port``."""
+    relay = RelayServer()
+    relay.attach(
+        await asyncio.start_unix_server(
+            _relay_handler(relay, lambda: asyncio.open_connection(host, port)), path=socket_path
+        )
+    )
+    return relay
+
+
+async def serve_tcp_to_unix(socket_path: str) -> RelayServer:
+    """Sandbox side: listen on a free loopback port and forward each connection to the unix socket."""
+    relay = RelayServer()
+    relay.attach(
+        await asyncio.start_server(
+            _relay_handler(relay, lambda: asyncio.open_unix_connection(socket_path)), "127.0.0.1", 0
+        )
+    )
+    return relay
+
+
+def rewrite_model_base_url(url: str, port: int) -> str:
+    """Point an http model URL at the loopback relay port, keeping its path."""
+    parts = urlsplit(url)
+    if parts.scheme != "http":
+        raise ValueError(f"the policy egress relay forwards plain HTTP only, got {url!r}")
+    return urlunsplit(("http", f"127.0.0.1:{port}", parts.path, parts.query, parts.fragment))
+
+
+@asynccontextmanager
+async def policy_endpoint(config: dict[str, Any]) -> AsyncIterator[str]:
+    """Yield the model base URL for the client, relayed through ``model_egress_socket`` when configured."""
+    socket_path = config.get("model_egress_socket")
+    if not socket_path:
+        yield config["model_base_url"]
+        return
+    relay = await serve_tcp_to_unix(str(socket_path))
+    try:
+        yield rewrite_model_base_url(config["model_base_url"], relay.port)
+    finally:
+        await relay.close()
+
+
 async def run_stirrup_rollout(
     config: dict[str, Any],
     gateway_url: str,
@@ -1127,6 +1315,7 @@ async def run_stirrup_rollout(
     from stirrup.tools.mcp import MCPConfig, MCPToolProvider, StreamableHttpServerConfig
 
     install_tool_argument_coercion(Agent)
+    install_json_schema_to_pydantic_array_items_patch()
     install_tool_schema_type_annotation()
 
     class ToolNameParams(BaseModel):
@@ -1346,102 +1535,108 @@ async def run_stirrup_rollout(
         "temperature": float(config["temperature"]),
         "top_p": float(config["top_p"]),
     }
-    checkpointing_client_class = make_checkpointing_client_class(ChatCompletionsClient)
-    client = checkpointing_client_class(
-        model=config["policy_model"],
-        base_url=config["model_base_url"],
-        api_key="unused",
-        max_tokens=int(config["max_output_tokens"]),
-        kwargs=model_kwargs,
-    )
-    managed_tools = ManagedMCPTools()
-    agent = Agent(
-        client=client,
-        name="apex_stirrup_agent",
-        max_turns=int(config["max_turns"]),
-        system_prompt=SYSTEM_PROMPT,
-        tools=[managed_tools],
-        finish_tool=finish_tool,
-        # Chat Completions tool messages accept text only. Stirrup preserves
-        # image results by moving each image into a following user message.
-        text_only_tool_responses=True,
-    )
-    managed_tools.attach(agent)
-
-    checkpointer: ResumeCheckpointer | None = None
-    if resume_checkpoint_dir is not None:
-        checkpointer = ResumeCheckpointer(
-            resume_checkpoint_dir,
-            snapshot_world=write_snapshot,
-            apex_state=lambda: collect_apex_state(
-                agent=agent, catalog=managed_tools.catalog, todo_state=todo_state, client=client
-            ),
-            initial_snapshot=initial_snapshot_path,
-            min_interval_seconds=float(
-                config.get("resume_checkpoint_interval_seconds", DEFAULT_RESUME_CHECKPOINT_INTERVAL_SECONDS)
-            ),
-            prior_elapsed_seconds=resume_checkpoint.elapsed_seconds if resume_checkpoint is not None else 0.0,
-            prior_segments=resume_checkpoint.segments if resume_checkpoint is not None else 0,
-            prior_generation=resume_checkpoint.generation if resume_checkpoint is not None else 0,
-            resumed_turn=resume_checkpoint.turn if resume_checkpoint is not None else None,
-            segment_started_at=segment_started_at,
+    async with policy_endpoint(config) as model_base_url:
+        client_class = ChatCompletionsClient
+        if config.get("context_window_tokens"):
+            client_class = context_window_client(ChatCompletionsClient, int(config["context_window_tokens"]))
+        client_class = make_checkpointing_client_class(client_class)
+        client = client_class(
+            model=config["policy_model"],
+            base_url=model_base_url,
+            api_key="unused",  # pragma: allowlist secret
+            max_tokens=int(config["max_output_tokens"]),
+            kwargs=model_kwargs,
         )
-        client.on_generate_start = lambda: checkpointer.on_generate_start(getattr(agent, "_current_run_state", None))
-        managed_tools.checkpointer = checkpointer
-    resumed_from_turn: int | None = None
-    if resume_checkpoint is not None:
-        stage_stirrup_resume_state(
-            resume_checkpoint,
-            resume_checkpoint.directory / RESUME_STIRRUP_CACHE_DIRNAME,
-            config["instruction"],
+        managed_tools = ManagedMCPTools()
+        agent = Agent(
+            client=client,
+            name="apex_stirrup_agent",
+            max_turns=int(config["max_turns"]),
+            system_prompt=SYSTEM_PROMPT,
+            tools=[managed_tools],
+            finish_tool=finish_tool,
+            # Chat Completions tool messages accept text only. Stirrup preserves
+            # image results by moving each image into a following user message.
+            text_only_tool_responses=True,
         )
-        resumed_from_turn = resume_checkpoint.turn
-    segment_fields = {
-        "resume_segments": checkpointer.segments if checkpointer is not None else 1,
-        "resumed_from_turn": resumed_from_turn,
-    }
+        managed_tools.attach(agent)
 
-    async with agent.session(resume=resume_checkpoint is not None) as session:
+        checkpointer: ResumeCheckpointer | None = None
+        if resume_checkpoint_dir is not None:
+            checkpointer = ResumeCheckpointer(
+                resume_checkpoint_dir,
+                snapshot_world=write_snapshot,
+                apex_state=lambda: collect_apex_state(
+                    agent=agent, catalog=managed_tools.catalog, todo_state=todo_state, client=client
+                ),
+                initial_snapshot=initial_snapshot_path,
+                min_interval_seconds=float(
+                    config.get("resume_checkpoint_interval_seconds", DEFAULT_RESUME_CHECKPOINT_INTERVAL_SECONDS)
+                ),
+                prior_elapsed_seconds=resume_checkpoint.elapsed_seconds if resume_checkpoint is not None else 0.0,
+                prior_segments=resume_checkpoint.segments if resume_checkpoint is not None else 0,
+                prior_generation=resume_checkpoint.generation if resume_checkpoint is not None else 0,
+                resumed_turn=resume_checkpoint.turn if resume_checkpoint is not None else None,
+                segment_started_at=segment_started_at,
+            )
+            client.on_generate_start = lambda: checkpointer.on_generate_start(
+                getattr(agent, "_current_run_state", None)
+            )
+            managed_tools.checkpointer = checkpointer
+        resumed_from_turn: int | None = None
         if resume_checkpoint is not None:
-            restored = restore_apex_state(
-                agent=agent,
-                catalog=managed_tools.catalog,
-                todo_state=todo_state,
-                todo_item_cls=TodoItem,
-                client=client,
-                apex_state=resume_checkpoint.apex_state,
+            stage_stirrup_resume_state(
+                resume_checkpoint,
+                resume_checkpoint.directory / RESUME_STIRRUP_CACHE_DIRNAME,
+                config["instruction"],
             )
-            LOGGER.warning(
-                "resuming from turn %d as segment %d with %.0fs already spent; restored %d tool(s), %d todo(s)",
-                resume_checkpoint.turn,
-                resume_checkpoint.segments + 1,
-                resume_checkpoint.elapsed_seconds,
-                restored["active_tools"],
-                restored["todos"],
+            resumed_from_turn = resume_checkpoint.turn
+        segment_fields = {
+            "resume_segments": checkpointer.segments if checkpointer is not None else 1,
+            "resumed_from_turn": resumed_from_turn,
+        }
+
+        async with agent.session(resume=resume_checkpoint is not None) as session:
+            if resume_checkpoint is not None:
+                restored = restore_apex_state(
+                    agent=agent,
+                    catalog=managed_tools.catalog,
+                    todo_state=todo_state,
+                    todo_item_cls=TodoItem,
+                    client=client,
+                    apex_state=resume_checkpoint.apex_state,
+                )
+                LOGGER.warning(
+                    "resuming from turn %d as segment %d with %.0fs already spent; restored %d tool(s), %d todo(s)",
+                    resume_checkpoint.turn,
+                    resume_checkpoint.segments + 1,
+                    resume_checkpoint.elapsed_seconds,
+                    restored["active_tools"],
+                    restored["todos"],
+                )
+            checkpoint_task = (
+                asyncio.create_task(_checkpoint_partial_result(session, checkpoint_path, segment_fields, checkpointer))
+                if checkpoint_path is not None
+                else None
             )
-        checkpoint_task = (
-            asyncio.create_task(_checkpoint_partial_result(session, checkpoint_path, segment_fields, checkpointer))
-            if checkpoint_path is not None
-            else None
-        )
-        try:
-            finish_params, history, metadata = await session.run(config["instruction"])
-        except BaseException as exc:
-            if checkpoint_path is not None:
-                with suppress(Exception):
-                    write_partial_result_checkpoint(
-                        session,
-                        checkpoint_path,
-                        completion_status="error",
-                        error=f"{type(exc).__name__}: {exc}",
-                        extra=segment_fields,
-                    )
-            raise
-        finally:
-            if checkpoint_task is not None:
-                checkpoint_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await checkpoint_task
+            try:
+                finish_params, history, metadata = await session.run(config["instruction"])
+            except BaseException as exc:
+                if checkpoint_path is not None:
+                    with suppress(Exception):
+                        write_partial_result_checkpoint(
+                            session,
+                            checkpoint_path,
+                            completion_status="error",
+                            error=f"{type(exc).__name__}: {exc}",
+                            extra=segment_fields,
+                        )
+                raise
+            finally:
+                if checkpoint_task is not None:
+                    checkpoint_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await checkpoint_task
 
     input_tokens, output_tokens, reasoning_tokens = _token_usage(history)
     completion_status = getattr(finish_params, "status", None)
