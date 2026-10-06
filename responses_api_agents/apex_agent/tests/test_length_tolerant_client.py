@@ -222,8 +222,9 @@ def test_run_stirrup_rollout_builds_the_length_tolerant_client() -> None:
 
     factory_calls = [call for call in calls if call.func.id == "make_length_tolerant_client_class"]
     assert len(factory_calls) == 1
+    # It wraps the selected base class: the stock client, or its context-window subclass.
     assert isinstance(factory_calls[0].args[0], ast.Name)
-    assert factory_calls[0].args[0].id == "ChatCompletionsClient"
+    assert factory_calls[0].args[0].id == "client_class"
 
     # The stock class must not be instantiated directly any more.
     assert not [call for call in calls if call.func.id == "ChatCompletionsClient"]
